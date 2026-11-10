@@ -1,0 +1,10 @@
+.env
+# Python temp files
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+# requirements.txt
+.env.*
+.envrc
+!.env.example
