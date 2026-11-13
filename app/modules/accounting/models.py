@@ -180,7 +180,7 @@ class Account(Base, UUIDMixin, TimestampMixin):
 
     code: Mapped[str] = mapped_column(String(20), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
-    type: Mapped[AccountType] = mapped_column(SAEnum(AccountType, name="account_type"), nullable=False, index=True)
+    type: Mapped[AccountType] = mapped_column(SAEnum(AccountType, name="accounting_account_type"), nullable=False, index=True)
     parent_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=True, index=True
     )

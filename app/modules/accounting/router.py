@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import uuid
 from datetime import datetime
@@ -31,6 +33,8 @@ from app.modules.accounting.seed import seed_chart_of_accounts
 from app.modules.auth.dependencies import get_current_admin, get_current_seller
 from app.modules.auth.models import Admin, Seller
 
+from app.core.config import settings
+from app.db.session import get_db
 router = APIRouter(tags=["accounting"])
 
 
@@ -56,26 +60,28 @@ async def list_accounts(
 
 
 @router.get("/admin/accounting/accounts/tree", response_model=list[schemas.AccountTreeNode])
+@router.get("/accounts/tree", response_model=list[schemas.AccountTreeNode])
 async def get_account_tree(
     db: AsyncSession = Depends(get_db),
     admin: Admin = Depends(get_current_admin),
 ):
-    stmt = (
-        select(Account)
-        .options(selectinload(Account.children))
-        .where(Account.parent_id.is_(None))
-        .order_by(Account.code)
-    )
-    res = await db.execute(stmt)
-    roots = res.scalars().all()
+    result = await db.execute(select(Account).order_by(Account.code))
+    accounts = result.scalars().all()
+
+    by_parent: dict[uuid.UUID | None, list[Account]] = {}
+    for acc in accounts:
+        by_parent.setdefault(acc.parent_id, []).append(acc)
 
     def build_node(acc: Account) -> schemas.AccountTreeNode:
-        node = schemas.AccountTreeNode.model_validate(acc)
-        node.children = [build_node(child) for child in acc.children]
-        return node
+        data = {
+            col.key: getattr(acc, col.key)
+            for col in Account.__table__.columns
+        }
+        data["normal_balance"] = acc.normal_balance
+        data["children"] = [build_node(child) for child in by_parent.get(acc.id, [])]
+        return schemas.AccountTreeNode.model_validate(data)
 
-    return [build_node(r) for r in roots]
-
+    return [build_node(root) for root in by_parent.get(None, [])]
 
 @router.post("/admin/accounting/accounts", response_model=schemas.AccountOut, status_code=status.HTTP_201_CREATED)
 async def create_account(
@@ -136,13 +142,48 @@ async def seed_coa_endpoint(
     db: AsyncSession = Depends(get_db),
     admin: Admin = Depends(get_current_admin),
 ):
-    codes = await seed_chart_of_accounts(db, currency=currency)
+    codes = await seed_chart_of_accounts(db)
     return {"message": "Chart of Accounts successfully seeded.", "accounts_count": len(codes)}
 
 
 # ============================================================================
 # 2. SETTINGS & FISCAL PERIODS (ADMIN)
 # ============================================================================
+
+@router.post("/accounting/webhooks/ecommerce", status_code=status.HTTP_200_OK)
+async def ecommerce_bridge_webhook(
+    request: Request,
+    x_signature_256: str | None = Header(default=None, alias="X-Signature-256"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Receives HMAC-SHA256 signed financial events from hamads-dev accounting_bridge.py.
+    """
+    secret = getattr(settings, "ACCOUNTING_WEBHOOK_SECRET", None)
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ACCOUNTING_WEBHOOK_SECRET is not configured",
+        )
+
+    raw_body = await request.body()
+    expected_sig = hmac.new(
+        secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not x_signature_256 or not hmac.compare_digest(expected_sig, x_signature_256):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook signature",
+        )
+
+    payload = json.loads(raw_body.decode("utf-8"))
+    event_type = payload.get("event_type", "")
+    data = payload.get("data") or {}
+
+    return await service.ingest_ecommerce_webhook_event(db, event_type, data)
 
 @router.get("/admin/accounting/settings", response_model=schemas.AccountingSettingsOut)
 async def get_accounting_settings(

@@ -19,7 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # 1. ENUMS
-    account_type = postgresql.ENUM('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE', name='account_type', create_type=False)
+    account_type = postgresql.ENUM('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE', name='accounting_account_type', create_type=False)
     journal_entry_status = postgresql.ENUM('DRAFT', 'POSTED', 'VOIDED', name='journal_entry_status', create_type=False)
     transaction_type = postgresql.ENUM(
         'ORDER_PAYMENT', 'ESCROW_RELEASE', 'VENDOR_PAYOUT', 'REFUND', 'DISPUTE_HOLD',
@@ -274,3 +274,11 @@ def downgrade() -> None:
     op.drop_table('accounts')
     op.drop_table('accounting_fiscal_periods')
     op.drop_table('accounting_settings')
+
+    for enum_name in [
+        'reconciliation_status', 'tax_rate_type', 'expense_bill_status',
+        'vendor_payout_status', 'refund_status', 'payment_transaction_status',
+        'fiscal_period_status', 'sub_ledger_type', 'transaction_type',
+        'journal_entry_status', 'accounting_account_type',
+    ]:
+        postgresql.ENUM(name=enum_name).drop(op.get_bind(), checkfirst=True)

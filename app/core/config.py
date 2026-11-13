@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     PAYSTACK_SECRET_KEY: str
     OPAY_SECRET_KEY: str | None = None
     SQUAD_SECRET_KEY: str | None = None
+    ACCOUNTING_INTEGRATION_KEY: str | None = None
+    ACCOUNTING_WEBHOOK_SECRET: str | None = None
 
     CORS_ORIGINS: list[str] = ["*"]
     
@@ -34,6 +36,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str
     SMTP_FROM_EMAIL: str
 
+    ACCOUNTING_WEBHOOK_SECRET: str | None = None
 
 @lru_cache
 def get_settings() -> Settings:

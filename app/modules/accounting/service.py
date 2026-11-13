@@ -1062,7 +1062,7 @@ async def generate_profit_and_loss(
         elif row.type == AccountType.EXPENSE:
             net_exp = _quantize(dr - cr)
             if net_exp != 0:
-                if row.code in ("5010", "5020"):
+                if row.code.startswith("5"):
                     cost_of_sales.append(ReportLineItem(code=row.code, name=row.name, amount=net_exp))
                     total_cost_of_sales += net_exp
                 else:
@@ -1401,3 +1401,259 @@ async def export_general_ledger_csv(db: AsyncSession, start_date: datetime | Non
         ])
 
     return output.getvalue()
+
+# ============================================================================
+# 7. E-COMMERCE BRIDGE WEBHOOK INGESTION (HMAC-SHA256 EVENTS)
+# ============================================================================
+
+async def ingest_ecommerce_webhook_event(
+    db: AsyncSession, event_type: str, data: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Maps signed financial events emitted by `hamads-dev` into balanced IFRS
+    double-entry journal entries using `transaction_id` for idempotency.
+    """
+    from app.modules.accounting.schemas import JournalLineIn
+
+    tx_id = str(data.get("transaction_id") or data.get("reference") or "")
+    if not tx_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Webhook payload missing transaction_id",
+        )
+
+    currency = str(data.get("currency") or "NGN")
+    idem_key = f"BRIDGE-{event_type}-{tx_id}"
+
+    # Fast idempotency check
+    existing = (
+        await db.execute(select(JournalEntry).where(JournalEntry.idempotency_key == idem_key))
+    ).scalar_one_or_none()
+    if existing:
+        return {"status": "duplicate_ignored", "entry_number": existing.entry_number}
+
+    lines: list[JournalLineIn] = []
+    tx_type = TransactionType.ORDER_PAYMENT
+    narration = f"E-commerce bridge event {event_type} ({tx_id})"
+
+    if event_type == "order.payment_received":
+        gross = _quantize(data.get("gross_amount", 0))
+        platform_fee = _quantize(data.get("platform_fee", 0))
+        delivery_fee = _quantize(data.get("delivery_fee", 0))
+        seller_payable = _quantize(data.get("seller_payable", 0))
+
+        # Reconcile any 1-kobo rounding difference into seller_payable
+        credit_sum = seller_payable + platform_fee + delivery_fee
+        if gross != credit_sum:
+            seller_payable = _quantize(gross - platform_fee - delivery_fee)
+
+        order_id = str(data.get("order_id") or tx_id)
+        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
+
+        lines.append(
+            JournalLineIn(
+                account_code="1020",
+                debit=gross,
+                credit=Decimal("0.0000"),
+                sub_ledger_type=SubLedgerType.GATEWAY,
+                sub_ledger_id=tx_id,
+                currency=currency,
+                description=f"Gateway payment captured for Order {order_id}",
+            )
+        )
+        if seller_payable > Decimal("0.0000"):
+            lines.append(
+                JournalLineIn(
+                    account_code="2030",
+                    debit=Decimal("0.0000"),
+                    credit=seller_payable,
+                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
+                    sub_ledger_id=seller_id,
+                    currency=currency,
+                    description=f"Net seller payable for Order {order_id}",
+                )
+            )
+        if platform_fee > Decimal("0.0000"):
+            lines.append(
+                JournalLineIn(
+                    account_code="4010",
+                    debit=Decimal("0.0000"),
+                    credit=platform_fee,
+                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
+                    sub_ledger_id=seller_id,
+                    currency=currency,
+                    description=f"Platform commission earned on Order {order_id}",
+                )
+            )
+        if delivery_fee > Decimal("0.0000"):
+            lines.append(
+                JournalLineIn(
+                    account_code="2040",
+                    debit=Decimal("0.0000"),
+                    credit=delivery_fee,
+                    sub_ledger_type=SubLedgerType.NONE,
+                    currency=currency,
+                    description=f"Rider delivery share payable for Order {order_id}",
+                )
+            )
+        tx_type = TransactionType.ORDER_PAYMENT
+        narration = f"Order payment received ({order_id}) via {data.get('provider', 'gateway')}"
+
+    elif event_type == "seller.payout_disbursed":
+        amount = _quantize(data.get("amount", 0))
+        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
+        lines = [
+            JournalLineIn(
+                account_code="2030",
+                debit=amount,
+                credit=Decimal("0.0000"),
+                sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
+                sub_ledger_id=seller_id,
+                currency=currency,
+                description=f"Seller payout disbursed ({tx_id})",
+            ),
+            JournalLineIn(
+                account_code="1020",
+                debit=Decimal("0.0000"),
+                credit=amount,
+                sub_ledger_type=SubLedgerType.GATEWAY,
+                sub_ledger_id=tx_id,
+                currency=currency,
+                description=f"Gateway transfer out for seller payout ({tx_id})",
+            ),
+        ]
+        tx_type = TransactionType.VENDOR_PAYOUT
+        narration = f"Seller payout disbursed ({tx_id})"
+
+    elif event_type == "seller.payout_reversed":
+        amount = _quantize(data.get("amount", 0))
+        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
+        lines = [
+            JournalLineIn(
+                account_code="1020",
+                debit=amount,
+                credit=Decimal("0.0000"),
+                sub_ledger_type=SubLedgerType.GATEWAY,
+                sub_ledger_id=tx_id,
+                currency=currency,
+                description=f"Reversed payout funds returned ({tx_id})",
+            ),
+            JournalLineIn(
+                account_code="2030",
+                debit=Decimal("0.0000"),
+                credit=amount,
+                sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
+                sub_ledger_id=seller_id,
+                currency=currency,
+                description=f"Seller payable restored after failed payout ({tx_id})",
+            ),
+        ]
+        tx_type = TransactionType.ADJUSTMENT
+        narration = f"Seller payout reversed ({tx_id})"
+
+    elif event_type == "rider.payout_disbursed":
+        amount = _quantize(data.get("amount", 0))
+        rider_id = str(data["rider_id"]) if data.get("rider_id") else None
+        lines = [
+            JournalLineIn(
+                account_code="2040",
+                debit=amount,
+                credit=Decimal("0.0000"),
+                sub_ledger_type=SubLedgerType.NONE,
+                sub_ledger_id=rider_id,
+                currency=currency,
+                description=f"Rider payout disbursed ({tx_id})",
+            ),
+            JournalLineIn(
+                account_code="1020",
+                debit=Decimal("0.0000"),
+                credit=amount,
+                sub_ledger_type=SubLedgerType.GATEWAY,
+                sub_ledger_id=tx_id,
+                currency=currency,
+                description=f"Gateway transfer out for rider payout ({tx_id})",
+            ),
+        ]
+        tx_type = TransactionType.VENDOR_PAYOUT
+        narration = f"Rider payout disbursed ({tx_id})"
+
+    elif event_type == "order.cancelled":
+        refunded = _quantize(data.get("refunded_amount", 0))
+        seller_deducted = _quantize(data.get("seller_deducted", 0))
+        commission_rev = _quantize(data.get("platform_commission_reversed", 0))
+        delivery_rev = _quantize(data.get("delivery_fee_reversed", 0))
+
+        # If breakdown wasn't supplied, allocate full refund to seller payable (2030)
+        if seller_deducted == 0 and commission_rev == 0 and delivery_rev == 0:
+            seller_deducted = refunded
+        elif (seller_deducted + commission_rev + delivery_rev) != refunded:
+            seller_deducted = _quantize(refunded - commission_rev - delivery_rev)
+
+        order_id = str(data.get("order_id") or tx_id)
+        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
+
+        if seller_deducted > Decimal("0.0000"):
+            lines.append(
+                JournalLineIn(
+                    account_code="2030",
+                    debit=seller_deducted,
+                    credit=Decimal("0.0000"),
+                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
+                    sub_ledger_id=seller_id,
+                    currency=currency,
+                    description=f"Seller payable reversed on cancelled Order {order_id}",
+                )
+            )
+        if commission_rev > Decimal("0.0000"):
+            lines.append(
+                JournalLineIn(
+                    account_code="4090",
+                    debit=commission_rev,
+                    credit=Decimal("0.0000"),
+                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
+                    sub_ledger_id=seller_id,
+                    currency=currency,
+                    description=f"Platform commission reversed on cancelled Order {order_id}",
+                )
+            )
+        if delivery_rev > Decimal("0.0000"):
+            lines.append(
+                JournalLineIn(
+                    account_code="2040",
+                    debit=delivery_rev,
+                    credit=Decimal("0.0000"),
+                    sub_ledger_type=SubLedgerType.NONE,
+                    currency=currency,
+                    description=f"Rider payable reversed on cancelled Order {order_id}",
+                )
+            )
+        lines.append(
+            JournalLineIn(
+                account_code="1020",
+                debit=Decimal("0.0000"),
+                credit=refunded,
+                sub_ledger_type=SubLedgerType.GATEWAY,
+                sub_ledger_id=tx_id,
+                currency=currency,
+                description=f"Customer refund disbursed for Order {order_id}",
+            )
+        )
+        tx_type = TransactionType.REFUND
+        narration = f"Order cancelled & refunded ({order_id})"
+
+    else:
+        return {"status": "ignored", "reason": f"Unhandled event_type: {event_type}"}
+
+    entry = await post_journal_entry(
+        db,
+        JournalEntryCreate(
+            transaction_type=tx_type,
+            reference_id=tx_id,
+            idempotency_key=idem_key,
+            narration=narration,
+            currency=currency,
+            lines=lines,
+        ),
+    )
+    await db.commit()
+    return {"status": "recorded", "entry_number": entry.entry_number}

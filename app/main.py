@@ -11,7 +11,6 @@ from app.modules.wishlist.router import router as wishlist_router
 from app.modules.fulfillment.router import router as fulfillment_router
 from app.modules.admin.router import router as admin_router
 from app.modules.accounting.router import router as accounting_router
-from app.modules.payments.router import router as payments_router, seller_router as payments_seller_router, admin_router as payments_admin_router, rider_router as payments_rider_router
 
 app = FastAPI(
     title="Hamads API",
@@ -19,13 +18,24 @@ app = FastAPI(
     docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
 )
 
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=settings.CORS_ORIGINS,
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=[o for o in settings.CORS_ORIGINS if o != "*"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 @app.get("/health")
@@ -42,7 +52,4 @@ app.include_router(wishlist_router)
 app.include_router(fulfillment_router)
 app.include_router(admin_router)
 app.include_router(accounting_router)
-app.include_router(payments_router)
-app.include_router(payments_seller_router)
-app.include_router(payments_admin_router)
-app.include_router(payments_rider_router)
+
