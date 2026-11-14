@@ -62,10 +62,13 @@ class TransactionType(str, enum.Enum):
     EXPENSE_PAYMENT = "EXPENSE_PAYMENT"
     ADJUSTMENT = "ADJUSTMENT"
     OPENING_BALANCE = "OPENING_BALANCE"
+    RIDER_EARNING = "RIDER_EARNING"
+    RIDER_PAYOUT = "RIDER_PAYOUT"
 
 
 class SubLedgerType(str, enum.Enum):
     VENDOR = "VENDOR"
+    RIDER = "RIDER"
     CUSTOMER = "CUSTOMER"
     GATEWAY = "GATEWAY"
     EXPENSE_VENDOR = "EXPENSE_VENDOR"
@@ -276,123 +279,16 @@ class JournalLine(Base, UUIDMixin):
 # 3. PAYMENT GATEWAY TRANSACTIONS & REFUNDS
 # ============================================================================
 
-class PaymentTransaction(Base, UUIDMixin, TimestampMixin):
-    """
-    Tracks authoritative provider collections (Paystack/Stripe/OPay).
-    """
-    __tablename__ = "payment_transactions"
-
-    provider: Mapped[str] = mapped_column(String(50), default="paystack", nullable=False)
-    provider_reference: Mapped[str] = mapped_column(String(150), unique=True, index=True, nullable=False)
-    idempotency_key: Mapped[str] = mapped_column(String(150), unique=True, index=True, nullable=False)
-    order_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="RESTRICT"), index=True, nullable=False
-    )
-    customer_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), index=True, nullable=False
-    )
-    currency: Mapped[str] = mapped_column(String(3), default="NGN", nullable=False)
-    gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
-    provider_fee: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0.0000"), nullable=False)
-    net_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
-    status: Mapped[PaymentTransactionStatus] = mapped_column(
-        SAEnum(PaymentTransactionStatus, name="payment_transaction_status"),
-        default=PaymentTransactionStatus.INITIATED,
-        nullable=False,
-        index=True,
-    )
-    journal_entry_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("journal_entries.id", ondelete="SET NULL"), nullable=True
-    )
-    raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class RefundRecord(Base, UUIDMixin, TimestampMixin):
-    """
-    Customer refund records linked to payment transactions and double-entry reversal.
-    """
-    __tablename__ = "accounting_refunds"
-
-    payment_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("payment_transactions.id", ondelete="SET NULL"), nullable=True
-    )
-    order_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="RESTRICT"), index=True, nullable=False
-    )
-    seller_order_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("seller_orders.id", ondelete="SET NULL"), nullable=True
-    )
-    customer_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), index=True, nullable=False
-    )
-    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
-    reason: Mapped[str] = mapped_column(String(255), nullable=False)
-    status: Mapped[RefundStatus] = mapped_column(
-        SAEnum(RefundStatus, name="refund_status"), default=RefundStatus.PENDING, nullable=False
-    )
-    provider_refund_reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
-    journal_entry_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("journal_entries.id", ondelete="SET NULL"), nullable=True
-    )
-    approved_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("admins.id", ondelete="SET NULL"), nullable=True
-    )
 
 
 # ============================================================================
 # 4. VENDOR PAYOUTS & DISPUTE RESERVES
 # ============================================================================
 
-class VendorPayout(Base, UUIDMixin, TimestampMixin):
-    """
-    Vendor withdrawal and bank disbursement records. Protected by row locking.
-    """
-    __tablename__ = "vendor_payouts"
-
-    payout_reference: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
-    vendor_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("sellers.id", ondelete="RESTRICT"), index=True, nullable=False
-    )
-    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
-    fee_deducted: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0.0000"), nullable=False)
-    net_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
-    currency: Mapped[str] = mapped_column(String(3), default="NGN", nullable=False)
-    bank_account_details: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[VendorPayoutStatus] = mapped_column(
-        SAEnum(VendorPayoutStatus, name="vendor_payout_status"),
-        default=VendorPayoutStatus.PENDING,
-        nullable=False,
-        index=True,
-    )
-    gateway_reference: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
-    journal_entry_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("journal_entries.id", ondelete="SET NULL"), nullable=True
-    )
-    failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    approved_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("admins.id", ondelete="SET NULL"), nullable=True
-    )
 
 
-class VendorReserveHold(Base, UUIDMixin, TimestampMixin):
-    """
-    Dispute risk management reserves held from delivered seller proceeds.
-    """
-    __tablename__ = "vendor_reserve_holds"
-
-    vendor_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("sellers.id", ondelete="RESTRICT"), index=True, nullable=False
-    )
-    reference_id: Mapped[str | None] = mapped_column(String(100), index=True, nullable=True)
-    hold_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
-    released_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0.0000"), nullable=False)
-    status: Mapped[str] = mapped_column(String(30), default="HELD", nullable=False)
-    release_due_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    journal_entry_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("journal_entries.id", ondelete="SET NULL"), nullable=True
-    )
 
 
 # ============================================================================
@@ -463,3 +359,20 @@ class BankStatementRow(Base, UUIDMixin, TimestampMixin):
     matched_journal_line_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("journal_lines.id", ondelete="SET NULL"), nullable=True
     )
+
+
+# ---------------------------------------------------------------------------
+# Added by cleanup_accounting.py: name directory for sellers and riders sent by hamads-dev
+# ---------------------------------------------------------------------------
+from sqlalchemy import UniqueConstraint  # noqa: E402
+
+
+class Party(Base, UUIDMixin, TimestampMixin):
+    """The ledger only stores ids on journal lines. This table remembers the matching names."""
+    __tablename__ = "accounting_parties"
+
+    party_type: Mapped[str] = mapped_column(String(20), index=True)   # "seller" | "rider"
+    external_id: Mapped[str] = mapped_column(String(64), index=True)  # the id used in hamads-dev
+    name: Mapped[str] = mapped_column(String(200))
+
+    __table_args__ = (UniqueConstraint("party_type", "external_id"),)

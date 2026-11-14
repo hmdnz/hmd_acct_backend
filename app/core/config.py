@@ -1,5 +1,5 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from functools import lru_cache
 
 
 class Settings(BaseSettings):
@@ -12,35 +12,21 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     DATABASE_URL: str
-    REDIS_URL: str
 
-    AWS_ACCESS_KEY_ID: str
-    AWS_SECRET_ACCESS_KEY: str
-    AWS_REGION: str
-    S3_BUCKET_NAME: str
+    # Must be exactly the same value as ACCOUNTING_WEBHOOK_SECRET in hamads-dev.
+    ACCOUNTING_WEBHOOK_SECRET: str
 
-    TERMII_API_KEY: str
-    TERMII_SENDER_ID: str
+    # Comma-separated origins allowed to call this API from a browser (your accounting frontend).
+    CORS_ORIGINS: str = "http://localhost:5173"
 
-    PAYSTACK_SECRET_KEY: str
-    OPAY_SECRET_KEY: str | None = None
-    SQUAD_SECRET_KEY: str | None = None
-    ACCOUNTING_INTEGRATION_KEY: str | None = None
-    ACCOUNTING_WEBHOOK_SECRET: str | None = None
-
-    CORS_ORIGINS: list[str] = ["*"]
-    
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
-    SMTP_USERNAME: str
-    SMTP_PASSWORD: str
-    SMTP_FROM_EMAIL: str
-
-    ACCOUNTING_WEBHOOK_SECRET: str | None = None
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _use_asyncpg_driver(cls, v: str) -> str:
+        # Render hands out "postgresql://..." (or "postgres://..."); this app needs the async driver.
+        for prefix in ("postgres://", "postgresql://"):
+            if v.startswith(prefix):
+                return "postgresql+asyncpg://" + v[len(prefix):]
+        return v
 
 
-settings = get_settings()
+settings = Settings()

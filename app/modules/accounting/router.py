@@ -11,7 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.session import get_db
-from app.modules.accounting import paystack, schemas, service
+from app.modules.accounting import (
+    schemas,
+    service,
+)
 from app.modules.accounting.models import (
     Account,
     AccountingSettings,
@@ -22,16 +25,18 @@ from app.modules.accounting.models import (
     JournalEntry,
     JournalEntryStatus,
     JournalLine,
-    PaymentTransaction,
     PaymentTransactionStatus,
     SubLedgerType,
     TransactionType,
-    VendorPayout,
     VendorPayoutStatus,
 )
 from app.modules.accounting.seed import seed_chart_of_accounts
-from app.modules.auth.dependencies import get_current_admin, get_current_seller
-from app.modules.auth.models import Admin, Seller
+from app.modules.auth.dependencies import (
+    get_current_admin,
+)
+from app.modules.auth.models import (
+    Admin,
+)
 
 from app.core.config import settings
 from app.db.session import get_db
@@ -150,40 +155,6 @@ async def seed_coa_endpoint(
 # 2. SETTINGS & FISCAL PERIODS (ADMIN)
 # ============================================================================
 
-@router.post("/accounting/webhooks/ecommerce", status_code=status.HTTP_200_OK)
-async def ecommerce_bridge_webhook(
-    request: Request,
-    x_signature_256: str | None = Header(default=None, alias="X-Signature-256"),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Receives HMAC-SHA256 signed financial events from hamads-dev accounting_bridge.py.
-    """
-    secret = getattr(settings, "ACCOUNTING_WEBHOOK_SECRET", None)
-    if not secret:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ACCOUNTING_WEBHOOK_SECRET is not configured",
-        )
-
-    raw_body = await request.body()
-    expected_sig = hmac.new(
-        secret.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not x_signature_256 or not hmac.compare_digest(expected_sig, x_signature_256):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid webhook signature",
-        )
-
-    payload = json.loads(raw_body.decode("utf-8"))
-    event_type = payload.get("event_type", "")
-    data = payload.get("data") or {}
-
-    return await service.ingest_ecommerce_webhook_event(db, event_type, data)
 
 @router.get("/admin/accounting/settings", response_model=schemas.AccountingSettingsOut)
 async def get_accounting_settings(
@@ -428,34 +399,10 @@ async def reverse_entry(
 # 4. LIFECYCLE EVENT TRIGGER ENDPOINTS (ADMIN / SYSTEM)
 # ============================================================================
 
-@router.post("/admin/accounting/events/order-paid", status_code=status.HTTP_201_CREATED)
-async def trigger_order_paid(
-    payload: schemas.OrderPaymentEvent,
-    db: AsyncSession = Depends(get_db),
-    admin: Admin = Depends(get_current_admin),
-):
-    entry = await service.post_order_payment(db, payload)
-    return {"message": "Order payment escrow posted.", "entry_number": entry.entry_number}
 
 
-@router.post("/admin/accounting/events/escrow-released", status_code=status.HTTP_201_CREATED)
-async def trigger_escrow_release(
-    payload: schemas.EscrowReleaseEvent,
-    db: AsyncSession = Depends(get_db),
-    admin: Admin = Depends(get_current_admin),
-):
-    entry = await service.post_escrow_release(db, payload)
-    return {"message": "Escrow released to vendor payable.", "entry_number": entry.entry_number}
 
 
-@router.post("/admin/accounting/events/refund", status_code=status.HTTP_201_CREATED)
-async def trigger_refund(
-    payload: schemas.RefundEvent,
-    db: AsyncSession = Depends(get_db),
-    admin: Admin = Depends(get_current_admin),
-):
-    entry = await service.post_order_refund(db, payload)
-    return {"message": "Refund posted to ledger.", "entry_number": entry.entry_number}
 
 
 @router.post("/admin/accounting/events/gateway-settlement", status_code=status.HTTP_201_CREATED)
@@ -481,83 +428,16 @@ async def admin_get_vendor_ledger(
     return await service.get_vendor_subledger_summary(db, vendor_id)
 
 
-@router.get("/admin/accounting/payouts", response_model=list[schemas.VendorPayoutOut])
-async def admin_list_payouts(
-    status_filter: VendorPayoutStatus | None = None,
-    vendor_id: uuid.UUID | None = None,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(get_db),
-    admin: Admin = Depends(get_current_admin),
-):
-    stmt = (
-        select(VendorPayout, Seller.brand_name)
-        .join(Seller, VendorPayout.vendor_id == Seller.id)
-        .order_by(desc(VendorPayout.created_at))
-    )
-    if status_filter:
-        stmt = stmt.where(VendorPayout.status == status_filter)
-    if vendor_id:
-        stmt = stmt.where(VendorPayout.vendor_id == vendor_id)
-
-    rows = (await db.execute(stmt.limit(limit).offset(offset))).all()
-    out = []
-    for p, brand in rows:
-        item = schemas.VendorPayoutOut.model_validate(p)
-        item.vendor_name = brand
-        out.append(item)
-    return out
 
 
-@router.post("/admin/accounting/payouts/{payout_id}/complete", response_model=schemas.VendorPayoutOut)
-async def admin_complete_payout(
-    payout_id: uuid.UUID,
-    payload: schemas.VendorPayoutProcess,
-    db: AsyncSession = Depends(get_db),
-    admin: Admin = Depends(get_current_admin),
-):
-    return await service.complete_vendor_payout(db, payout_id, payload.gateway_reference)
 
 
 # --- SELLER RESTRICTED ENDPOINTS (TENANT ISOLATION) ---
 
-@router.get("/seller/accounting/my-ledger", response_model=schemas.VendorSubLedgerSummary)
-async def seller_get_my_ledger(
-    db: AsyncSession = Depends(get_db),
-    seller: Seller = Depends(get_current_seller),
-):
-    """Enforces strict tenant isolation: sellers can ONLY view their own statement."""
-    return await service.get_vendor_subledger_summary(db, seller.id)
 
 
-@router.get("/seller/accounting/my-payouts", response_model=list[schemas.VendorPayoutOut])
-async def seller_list_my_payouts(
-    db: AsyncSession = Depends(get_db),
-    seller: Seller = Depends(get_current_seller),
-):
-    stmt = (
-        select(VendorPayout)
-        .where(VendorPayout.vendor_id == seller.id)
-        .order_by(desc(VendorPayout.created_at))
-    )
-    payouts = (await db.execute(stmt)).scalars().all()
-    out = []
-    for p in payouts:
-        item = schemas.VendorPayoutOut.model_validate(p)
-        item.vendor_name = seller.brand_name
-        out.append(item)
-    return out
 
 
-@router.post("/seller/accounting/request-payout", response_model=schemas.VendorPayoutOut, status_code=status.HTTP_201_CREATED)
-async def seller_request_payout(
-    payload: schemas.VendorPayoutCreate,
-    db: AsyncSession = Depends(get_db),
-    seller: Seller = Depends(get_current_seller),
-):
-    if payload.vendor_id != seller.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot request payout for another seller.")
-    return await service.create_vendor_payout(db, payload)
 
 
 # ============================================================================
@@ -651,44 +531,3 @@ async def export_gl_csv(
 # 8. PAYMENT PROVIDER WEBHOOK (AUTHORITATIVE PAYSTACK HANDLER)
 # ============================================================================
 
-@router.post("/accounting/webhooks/paystack", status_code=status.HTTP_200_OK)
-async def paystack_webhook(
-    request: Request,
-    x_paystack_signature: str | None = Header(None),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Authoritative Paystack Webhook Handler with HMAC-SHA512 Signature Verification.
-    """
-    raw_body = await request.body()
-    if not paystack.verify_paystack_webhook_signature(raw_body, x_paystack_signature):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature")
-
-    payload = json.loads(raw_body.decode("utf-8"))
-    event = payload.get("event")
-    data = payload.get("data", {})
-
-    if event == "charge.success":
-        reference = data.get("reference")
-        amount = Decimal(str(data.get("amount", 0))) / Decimal("100.0")  # kobo to naira
-        metadata = data.get("metadata", {})
-        order_id_str = metadata.get("order_id")
-        customer_id_str = metadata.get("customer_id")
-
-        if order_id_str and customer_id_str:
-            order_id = uuid.UUID(order_id_str)
-            customer_id = uuid.UUID(customer_id_str)
-
-            event_req = schemas.OrderPaymentEvent(
-                order_id=order_id,
-                total_amount=amount,
-                shipping_fee=Decimal(str(metadata.get("shipping_fee", "0.0"))),
-                gateway_reference=reference,
-                customer_id=customer_id,
-                currency=data.get("currency", "NGN"),
-                provider="paystack",
-                idempotency_key=f"PAYSTACK-CHARGE-{reference}",
-            )
-            await service.post_order_payment(db, event_req)
-
-    return {"status": "success"}

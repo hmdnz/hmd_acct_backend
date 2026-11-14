@@ -24,17 +24,13 @@ from app.modules.accounting.models import (
     JournalEntryStatus,
     JournalLine,
     NormalBalance,
-    PaymentTransaction,
     PaymentTransactionStatus,
     ReconciliationStatus,
-    RefundRecord,
     RefundStatus,
     SubLedgerType,
     TaxRate,
     TransactionType,
-    VendorPayout,
     VendorPayoutStatus,
-    VendorReserveHold,
 )
 from app.modules.accounting.schemas import (
     AccountingDashboardKPIs,
@@ -53,7 +49,6 @@ from app.modules.accounting.schemas import (
     VendorPayoutCreate,
     VendorSubLedgerSummary,
 )
-from app.modules.auth.models import Seller
 
 
 def _utc_now() -> datetime:
@@ -285,313 +280,12 @@ async def reverse_journal_entry(
 # 2. EVENT-DRIVEN ORDER LIFECYCLE & IFRS 15 REVENUE RECOGNITION
 # ============================================================================
 
-async def post_order_payment(db: AsyncSession, payload: OrderPaymentEvent) -> JournalEntry:
-    """
-    Lifecycle Event 1: Customer Order Placed & Paid.
-    Accounting Treatment:
-      Dr. 1020 Gateway Clearing Account (Asset increases with pending settlement)
-      Cr. 2010 Customer Escrow Liability (Platform obligation to fulfill)
-      Cr. 2020 Customer Shipping Fee Liability (Shipping collected in escrow)
-    """
-    total = _quantize(payload.total_amount)
-    shipping = _quantize(payload.shipping_fee)
-    escrow_merchandise = _quantize(total - shipping)
-
-    # 1. Record Payment Transaction
-    idempotency_key = payload.idempotency_key or f"PAY-{payload.gateway_reference}"
-    tx_stmt = select(PaymentTransaction).where(PaymentTransaction.provider_reference == payload.gateway_reference)
-    existing_tx = (await db.execute(tx_stmt)).scalar_one_or_none()
-
-    from app.modules.accounting.schemas import JournalLineIn
-
-    lines = [
-        JournalLineIn(
-            account_code="1020",
-            debit=total,
-            credit=Decimal("0.0000"),
-            sub_ledger_type=SubLedgerType.GATEWAY,
-            sub_ledger_id=payload.gateway_reference,
-            currency=payload.currency,
-            description=f"Gateway funds pending settlement - Ref: {payload.gateway_reference}",
-        ),
-        JournalLineIn(
-            account_code="2010",
-            debit=Decimal("0.0000"),
-            credit=escrow_merchandise,
-            sub_ledger_type=SubLedgerType.CUSTOMER,
-            sub_ledger_id=str(payload.customer_id),
-            currency=payload.currency,
-            description=f"Customer escrow hold for Order {payload.order_id}",
-        ),
-    ]
-
-    if shipping > Decimal("0.0000"):
-        lines.append(
-            JournalLineIn(
-                account_code="2020",
-                debit=Decimal("0.0000"),
-                credit=shipping,
-                sub_ledger_type=SubLedgerType.CUSTOMER,
-                sub_ledger_id=str(payload.customer_id),
-                currency=payload.currency,
-                description=f"Customer shipping deposit for Order {payload.order_id}",
-            )
-        )
-
-    entry = await post_journal_entry(
-        db,
-        JournalEntryCreate(
-            transaction_type=TransactionType.ORDER_PAYMENT,
-            reference_id=str(payload.order_id),
-            idempotency_key=idempotency_key,
-            narration=f"Payment received for Order {payload.order_id} via {payload.provider} ref {payload.gateway_reference}",
-            currency=payload.currency,
-            lines=lines,
-        ),
-    )
-
-    if not existing_tx:
-        payment_record = PaymentTransaction(
-            provider=payload.provider,
-            provider_reference=payload.gateway_reference,
-            idempotency_key=idempotency_key,
-            order_id=payload.order_id,
-            customer_id=payload.customer_id,
-            currency=payload.currency,
-            gross_amount=total,
-            provider_fee=Decimal("0.0000"),
-            net_amount=total,
-            status=PaymentTransactionStatus.CAPTURED,
-            journal_entry_id=entry.id,
-        )
-        db.add(payment_record)
-
-    await db.commit()
-    return entry
 
 
-async def post_escrow_release(db: AsyncSession, payload: EscrowReleaseEvent) -> JournalEntry:
-    """
-    Lifecycle Event 3: Order Delivered & Escrow Released (IFRS 15 Revenue Recognition Point).
-    Platform acts as Agent:
-      - Escrow liability is debited (obligation fulfilled).
-      - Platform Commission recognized in Revenue (4010).
-      - Fulfillment Revenue recognized (4020).
-      - Dispute safety reserve hold credited (1040).
-      - Withholding tax credited (2055).
-      - Net earnings credited to Merchant Payable (2030) for vendor payout.
-    """
-    idempotency_key = f"ESCROW-REL-{payload.seller_order_id}"
-    subtotal = _quantize(payload.subtotal)
-    shipping = _quantize(payload.shipping_fee_earned)
-    commission = _quantize(subtotal * payload.commission_rate)
-    reserve_hold = _quantize(subtotal * payload.reserve_hold_rate)
-    wht = _quantize((subtotal - commission) * payload.withholding_tax_rate)
-    net_merchant_payable = _quantize(subtotal - commission - reserve_hold - wht)
-
-    from app.modules.accounting.schemas import JournalLineIn
-
-    lines = [
-        # Release merchandise escrow
-        JournalLineIn(
-            account_code="2010",
-            debit=subtotal,
-            credit=Decimal("0.0000"),
-            sub_ledger_type=SubLedgerType.VENDOR,
-            sub_ledger_id=str(payload.seller_id),
-            description=f"Escrow release for delivered SellerOrder {payload.seller_order_id}",
-        ),
-    ]
-
-    if shipping > Decimal("0.0000"):
-        lines.append(
-            JournalLineIn(
-                account_code="2020",
-                debit=shipping,
-                credit=Decimal("0.0000"),
-                sub_ledger_type=SubLedgerType.NONE,
-                description=f"Release shipping liability to earned fulfillment fee",
-            )
-        )
-        lines.append(
-            JournalLineIn(
-                account_code="4020",
-                debit=Decimal("0.0000"),
-                credit=shipping,
-                sub_ledger_type=SubLedgerType.NONE,
-                description=f"Platform fulfillment revenue earned on Order {payload.order_id}",
-            )
-        )
-
-    # Credit Net Merchant Payable
-    lines.append(
-        JournalLineIn(
-            account_code="2030",
-            debit=Decimal("0.0000"),
-            credit=net_merchant_payable,
-            sub_ledger_type=SubLedgerType.VENDOR,
-            sub_ledger_id=str(payload.seller_id),
-            description=f"Net earnings credited to vendor payable - Order {payload.order_id}",
-        )
-    )
-
-    # Credit Platform Commission (IFRS 15 Agency Revenue)
-    lines.append(
-        JournalLineIn(
-            account_code="4010",
-            debit=Decimal("0.0000"),
-            credit=commission,
-            sub_ledger_type=SubLedgerType.VENDOR,
-            sub_ledger_id=str(payload.seller_id),
-            description=f"Platform commission ({payload.commission_rate*100:.1f}%) on Order {payload.order_id}",
-        )
-    )
-
-    # Credit Reserve Hold
-    if reserve_hold > Decimal("0.0000"):
-        lines.append(
-            JournalLineIn(
-                account_code="1040",
-                debit=Decimal("0.0000"),
-                credit=reserve_hold,
-                sub_ledger_type=SubLedgerType.VENDOR,
-                sub_ledger_id=str(payload.seller_id),
-                description=f"Dispute reserve hold ({payload.reserve_hold_rate*100:.1f}%) on SellerOrder {payload.seller_order_id}",
-            )
-        )
-        from datetime import timedelta
-        release_date = _utc_now() + timedelta(days=payload.reserve_days)
-        reserve_record = VendorReserveHold(
-            vendor_id=payload.seller_id,
-            reference_id=str(payload.seller_order_id),
-            hold_amount=reserve_hold,
-            status="HELD",
-            release_due_date=release_date,
-        )
-        db.add(reserve_record)
-
-    # Credit Withholding Tax
-    if wht > Decimal("0.0000"):
-        lines.append(
-            JournalLineIn(
-                account_code="2055",
-                debit=Decimal("0.0000"),
-                credit=wht,
-                sub_ledger_type=SubLedgerType.VENDOR,
-                sub_ledger_id=str(payload.seller_id),
-                description=f"Withholding tax deducted on Order {payload.order_id}",
-            )
-        )
-
-    entry = await post_journal_entry(
-        db,
-        JournalEntryCreate(
-            transaction_type=TransactionType.ESCROW_RELEASE,
-            reference_id=str(payload.seller_order_id),
-            idempotency_key=idempotency_key,
-            narration=f"IFRS 15 Escrow release & commission recognition for SellerOrder {payload.seller_order_id}",
-            lines=lines,
-        ),
-    )
-    await db.commit()
-    return entry
 
 
-async def process_seller_order_delivery(
-    db: AsyncSession, seller_order_id: uuid.UUID, commission_rate: Decimal = Decimal("0.1000")
-) -> JournalEntry:
-    """Convenience trigger to release escrow when a SellerOrder is confirmed delivered."""
-    from app.modules.orders.models import SellerOrder
-
-    so = await db.get(SellerOrder, seller_order_id)
-    if not so:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Seller order not found")
-
-    payload = EscrowReleaseEvent(
-        seller_order_id=so.id,
-        order_id=so.order_id,
-        seller_id=so.seller_id,
-        subtotal=so.subtotal,
-        commission_rate=commission_rate,
-        shipping_fee_earned=Decimal("0.0000"),
-        withholding_tax_rate=Decimal("0.0500"),
-        reserve_hold_rate=Decimal("0.0500"),
-        reserve_days=14,
-    )
-    return await post_escrow_release(db, payload)
 
 
-async def post_order_refund(db: AsyncSession, payload: RefundEvent) -> JournalEntry:
-    """
-    Refunds & Disputes Handling:
-      - If refund occurs prior to fulfillment: reverses customer escrow against gateway/bank clearing.
-      - If refund occurs post-delivery: reverses vendor payable and absorbs commission based on dispute policy.
-    """
-    amount = _quantize(payload.refund_amount)
-    from app.modules.accounting.schemas import JournalLineIn
-
-    if payload.seller_id:
-        lines = [
-            JournalLineIn(
-                account_code="2030",
-                debit=amount,
-                credit=Decimal("0.0000"),
-                sub_ledger_type=SubLedgerType.VENDOR,
-                sub_ledger_id=str(payload.seller_id),
-                description=f"Refund clawback from vendor: {payload.reason}",
-            ),
-            JournalLineIn(
-                account_code="1020",
-                debit=Decimal("0.0000"),
-                credit=amount,
-                sub_ledger_type=SubLedgerType.CUSTOMER,
-                sub_ledger_id=str(payload.customer_id),
-                description=f"Gateway refund payout to customer - Ref Order {payload.order_id}",
-            ),
-        ]
-    else:
-        lines = [
-            JournalLineIn(
-                account_code="2010",
-                debit=amount,
-                credit=Decimal("0.0000"),
-                sub_ledger_type=SubLedgerType.CUSTOMER,
-                sub_ledger_id=str(payload.customer_id),
-                description=f"Customer escrow cancellation refund: {payload.reason}",
-            ),
-            JournalLineIn(
-                account_code="1020",
-                debit=Decimal("0.0000"),
-                credit=amount,
-                sub_ledger_type=SubLedgerType.CUSTOMER,
-                sub_ledger_id=str(payload.customer_id),
-                description=f"Customer refund payout via gateway - Order {payload.order_id}",
-            ),
-        ]
-
-    entry = await post_journal_entry(
-        db,
-        JournalEntryCreate(
-            transaction_type=TransactionType.REFUND,
-            reference_id=str(payload.order_id),
-            narration=f"Refund processed for Order {payload.order_id}: {payload.reason}",
-            lines=lines,
-        ),
-    )
-
-    # Record Refund tracking record
-    refund_rec = RefundRecord(
-        order_id=payload.order_id,
-        seller_order_id=payload.seller_order_id,
-        customer_id=payload.customer_id,
-        amount=amount,
-        reason=payload.reason,
-        status=RefundStatus.COMPLETED,
-        journal_entry_id=entry.id,
-    )
-    db.add(refund_rec)
-    await db.commit()
-    return entry
 
 
 async def post_gateway_settlement(db: AsyncSession, payload: GatewaySettlementEvent) -> JournalEntry:
@@ -662,207 +356,12 @@ async def post_gateway_settlement(db: AsyncSession, payload: GatewaySettlementEv
 # 3. VENDOR SUB-LEDGER & PAYOUTS WITH CONCURRENCY ROW LOCKING
 # ============================================================================
 
-async def get_vendor_withdrawable_balance(db: AsyncSession, vendor_id: uuid.UUID) -> Decimal:
-    """
-    Calculates real-time withdrawable balance from Merchant Payables (2030)
-    for this vendor, subtracting any PENDING or PROCESSING payouts.
-    """
-    account_stmt = select(Account.id).where(Account.code == "2030")
-    account_id = (await db.execute(account_stmt)).scalar_one_or_none()
-    if not account_id:
-        return Decimal("0.0000")
-
-    lines_stmt = (
-        select(
-            func.coalesce(func.sum(JournalLine.credit), 0).label("credits"),
-            func.coalesce(func.sum(JournalLine.debit), 0).label("debits"),
-        )
-        .join(JournalEntry, JournalLine.journal_entry_id == JournalEntry.id)
-        .where(
-            JournalLine.account_id == account_id,
-            JournalLine.sub_ledger_type == SubLedgerType.VENDOR,
-            JournalLine.sub_ledger_id == str(vendor_id),
-            JournalEntry.status == JournalEntryStatus.POSTED,
-        )
-    )
-    res = (await db.execute(lines_stmt)).one()
-    ledger_balance = Decimal(str(res.credits)) - Decimal(str(res.debits))
-
-    pending_payouts_stmt = select(
-        func.coalesce(func.sum(VendorPayout.amount), 0)
-    ).where(
-        VendorPayout.vendor_id == vendor_id,
-        VendorPayout.status.in_([VendorPayoutStatus.PENDING, VendorPayoutStatus.PROCESSING, VendorPayoutStatus.APPROVED]),
-    )
-    pending_amount = (await db.execute(pending_payouts_stmt)).scalar_one()
-
-    return _quantize(ledger_balance - Decimal(str(pending_amount)))
 
 
-async def get_vendor_subledger_summary(db: AsyncSession, vendor_id: uuid.UUID) -> VendorSubLedgerSummary:
-    """Detailed vendor financial position breakdown."""
-    seller = await db.get(Seller, vendor_id)
-    vendor_name = f"{seller.brand_name} ({seller.first_name} {seller.last_name})" if seller else "Unknown Vendor"
-
-    stmt = (
-        select(Account.code, func.sum(JournalLine.debit), func.sum(JournalLine.credit))
-        .join(JournalLine, Account.id == JournalLine.account_id)
-        .join(JournalEntry, JournalLine.journal_entry_id == JournalEntry.id)
-        .where(
-            JournalLine.sub_ledger_type == SubLedgerType.VENDOR,
-            JournalLine.sub_ledger_id == str(vendor_id),
-            JournalEntry.status == JournalEntryStatus.POSTED,
-        )
-        .group_by(Account.code)
-    )
-    rows = (await db.execute(stmt)).all()
-
-    gross_sales = Decimal("0.0000")
-    commissions = Decimal("0.0000")
-    shipping_earned = Decimal("0.0000")
-    wht = Decimal("0.0000")
-    refunds = Decimal("0.0000")
-    reserves_held = Decimal("0.0000")
-
-    for code, d, c in rows:
-        d = Decimal(str(d or 0))
-        c = Decimal(str(c or 0))
-        if code == "2010":
-            gross_sales += d
-        elif code == "4010":
-            commissions += c
-        elif code == "4020":
-            shipping_earned += c
-        elif code == "2055":
-            wht += c
-        elif code == "1040":
-            reserves_held += c - d
-
-    completed_stmt = select(func.coalesce(func.sum(VendorPayout.amount), 0)).where(
-        VendorPayout.vendor_id == vendor_id,
-        VendorPayout.status == VendorPayoutStatus.COMPLETED,
-    )
-    completed_payouts = Decimal(str((await db.execute(completed_stmt)).scalar_one()))
-
-    pending_stmt = select(func.coalesce(func.sum(VendorPayout.amount), 0)).where(
-        VendorPayout.vendor_id == vendor_id,
-        VendorPayout.status.in_([VendorPayoutStatus.PENDING, VendorPayoutStatus.PROCESSING, VendorPayoutStatus.APPROVED]),
-    )
-    pending_payouts = Decimal(str((await db.execute(pending_stmt)).scalar_one()))
-
-    withdrawable = await get_vendor_withdrawable_balance(db, vendor_id)
-
-    return VendorSubLedgerSummary(
-        vendor_id=vendor_id,
-        vendor_name=vendor_name,
-        gross_sales=_quantize(gross_sales),
-        platform_commissions=_quantize(commissions),
-        shipping_earned=_quantize(shipping_earned),
-        withholding_tax=_quantize(wht),
-        refunds_deducted=_quantize(refunds),
-        reserves_held=_quantize(reserves_held),
-        total_payouts_completed=_quantize(completed_payouts),
-        pending_payouts=_quantize(pending_payouts),
-        current_withdrawable_balance=_quantize(withdrawable),
-    )
 
 
-async def create_vendor_payout(
-    db: AsyncSession, payload: VendorPayoutCreate, admin_id: uuid.UUID | None = None
-) -> VendorPayout:
-    """
-    Requests a vendor payout with strict row-level locking on the seller record
-    to prevent race conditions / double withdrawals.
-    """
-    amount = _quantize(payload.amount)
-
-    seller_stmt = select(Seller).where(Seller.id == payload.vendor_id).with_for_update()
-    seller = (await db.execute(seller_stmt)).scalar_one_or_none()
-    if not seller:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vendor not found")
-    if not seller.is_active:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Vendor account is deactivated")
-
-    available = await get_vendor_withdrawable_balance(db, payload.vendor_id)
-    if amount > available:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient withdrawable funds. Requested: {amount}, Available: {available}",
-        )
-
-    now = _utc_now()
-    payout_ref = f"PO-{now.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
-    payout = VendorPayout(
-        payout_reference=payout_ref,
-        vendor_id=payload.vendor_id,
-        amount=amount,
-        fee_deducted=Decimal("0.0000"),
-        net_amount=amount,
-        bank_account_details=json.dumps(payload.bank_account_details),
-        status=VendorPayoutStatus.PENDING,
-        approved_by=admin_id,
-    )
-    db.add(payout)
-    await db.commit()
-    await db.refresh(payout)
-    return payout
 
 
-async def complete_vendor_payout(
-    db: AsyncSession, payout_id: uuid.UUID, gateway_reference: str
-) -> VendorPayout:
-    """
-    Completes vendor payout post-bank confirmation:
-      Dr. 2030 Merchant Payables (Liability satisfied)
-      Cr. 1010 Operating Bank Account (Cash outflow)
-    """
-    stmt = select(VendorPayout).where(VendorPayout.id == payout_id).with_for_update()
-    payout = (await db.execute(stmt)).scalar_one_or_none()
-    if not payout:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payout record not found")
-
-    if payout.status == VendorPayoutStatus.COMPLETED:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payout already completed")
-
-    from app.modules.accounting.schemas import JournalLineIn
-
-    amount = _quantize(payout.amount)
-    lines = [
-        JournalLineIn(
-            account_code="2030",
-            debit=amount,
-            credit=Decimal("0.0000"),
-            sub_ledger_type=SubLedgerType.VENDOR,
-            sub_ledger_id=str(payout.vendor_id),
-            description=f"Vendor payout completed - Ref: {payout.payout_reference}",
-        ),
-        JournalLineIn(
-            account_code="1010",
-            debit=Decimal("0.0000"),
-            credit=amount,
-            sub_ledger_type=SubLedgerType.VENDOR,
-            sub_ledger_id=str(payout.vendor_id),
-            description=f"Bank wire outflow for vendor payout {payout.payout_reference}",
-        ),
-    ]
-
-    entry = await post_journal_entry(
-        db,
-        JournalEntryCreate(
-            transaction_type=TransactionType.VENDOR_PAYOUT,
-            reference_id=payout.payout_reference,
-            narration=f"Disbursement of vendor funds for payout {payout.payout_reference}",
-            lines=lines,
-        ),
-    )
-
-    payout.status = VendorPayoutStatus.COMPLETED
-    payout.gateway_reference = gateway_reference
-    payout.journal_entry_id = entry.id
-    payout.processed_at = _utc_now()
-    await db.commit()
-    await db.refresh(payout)
-    return payout
 
 
 # ============================================================================
@@ -1280,10 +779,7 @@ async def get_dashboard_kpis(db: AsyncSession) -> AccountingDashboardKPIs:
     h_res = (await db.execute(holding_stmt)).one()
     escrow_holding = _quantize(Decimal(str(h_res[0])) - Decimal(str(h_res[1])))
 
-    payout_stmt = select(func.coalesce(func.sum(VendorPayout.amount), 0)).where(
-        VendorPayout.status.in_([VendorPayoutStatus.PENDING, VendorPayoutStatus.PROCESSING, VendorPayoutStatus.APPROVED])
-    )
-    pending_payouts = _quantize(Decimal(str((await db.execute(payout_stmt)).scalar_one())))
+    pending_payouts = Decimal("0.0000")  # payouts are executed by hamads-dev, not here
 
     bank_stmt = (
         select(
@@ -1406,254 +902,61 @@ async def export_general_ledger_csv(db: AsyncSession, start_date: datetime | Non
 # 7. E-COMMERCE BRIDGE WEBHOOK INGESTION (HMAC-SHA256 EVENTS)
 # ============================================================================
 
-async def ingest_ecommerce_webhook_event(
-    db: AsyncSession, event_type: str, data: dict[str, Any]
-) -> dict[str, Any]:
-    """
-    Maps signed financial events emitted by `hamads-dev` into balanced IFRS
-    double-entry journal entries using `transaction_id` for idempotency.
-    """
-    from app.modules.accounting.schemas import JournalLineIn
 
-    tx_id = str(data.get("transaction_id") or data.get("reference") or "")
-    if not tx_id:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Webhook payload missing transaction_id",
+# ---------------------------------------------------------------------------
+# Added by cleanup_accounting.py: vendor position computed from the ledger alone
+# ---------------------------------------------------------------------------
+from app.modules.accounting.models import Party  # noqa: E402
+
+
+async def get_vendor_subledger_summary(db: AsyncSession, vendor_id: uuid.UUID) -> VendorSubLedgerSummary:
+    party = (await db.execute(
+        select(Party).where(Party.party_type == "seller", Party.external_id == str(vendor_id))
+    )).scalar_one_or_none()
+
+    rows = (await db.execute(
+        select(
+            Account.code, JournalEntry.transaction_type,
+            func.coalesce(func.sum(JournalLine.debit), 0), func.coalesce(func.sum(JournalLine.credit), 0),
         )
-
-    currency = str(data.get("currency") or "NGN")
-    idem_key = f"BRIDGE-{event_type}-{tx_id}"
-
-    # Fast idempotency check
-    existing = (
-        await db.execute(select(JournalEntry).where(JournalEntry.idempotency_key == idem_key))
-    ).scalar_one_or_none()
-    if existing:
-        return {"status": "duplicate_ignored", "entry_number": existing.entry_number}
-
-    lines: list[JournalLineIn] = []
-    tx_type = TransactionType.ORDER_PAYMENT
-    narration = f"E-commerce bridge event {event_type} ({tx_id})"
-
-    if event_type == "order.payment_received":
-        gross = _quantize(data.get("gross_amount", 0))
-        platform_fee = _quantize(data.get("platform_fee", 0))
-        delivery_fee = _quantize(data.get("delivery_fee", 0))
-        seller_payable = _quantize(data.get("seller_payable", 0))
-
-        # Reconcile any 1-kobo rounding difference into seller_payable
-        credit_sum = seller_payable + platform_fee + delivery_fee
-        if gross != credit_sum:
-            seller_payable = _quantize(gross - platform_fee - delivery_fee)
-
-        order_id = str(data.get("order_id") or tx_id)
-        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
-
-        lines.append(
-            JournalLineIn(
-                account_code="1020",
-                debit=gross,
-                credit=Decimal("0.0000"),
-                sub_ledger_type=SubLedgerType.GATEWAY,
-                sub_ledger_id=tx_id,
-                currency=currency,
-                description=f"Gateway payment captured for Order {order_id}",
-            )
+        .select_from(JournalLine)
+        .join(Account, JournalLine.account_id == Account.id)
+        .join(JournalEntry, JournalLine.journal_entry_id == JournalEntry.id)
+        .where(
+            JournalLine.sub_ledger_type == SubLedgerType.VENDOR,
+            JournalLine.sub_ledger_id == str(vendor_id),
+            JournalEntry.status == JournalEntryStatus.POSTED,
         )
-        if seller_payable > Decimal("0.0000"):
-            lines.append(
-                JournalLineIn(
-                    account_code="2030",
-                    debit=Decimal("0.0000"),
-                    credit=seller_payable,
-                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
-                    sub_ledger_id=seller_id,
-                    currency=currency,
-                    description=f"Net seller payable for Order {order_id}",
-                )
-            )
-        if platform_fee > Decimal("0.0000"):
-            lines.append(
-                JournalLineIn(
-                    account_code="4010",
-                    debit=Decimal("0.0000"),
-                    credit=platform_fee,
-                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
-                    sub_ledger_id=seller_id,
-                    currency=currency,
-                    description=f"Platform commission earned on Order {order_id}",
-                )
-            )
-        if delivery_fee > Decimal("0.0000"):
-            lines.append(
-                JournalLineIn(
-                    account_code="2040",
-                    debit=Decimal("0.0000"),
-                    credit=delivery_fee,
-                    sub_ledger_type=SubLedgerType.NONE,
-                    currency=currency,
-                    description=f"Rider delivery share payable for Order {order_id}",
-                )
-            )
-        tx_type = TransactionType.ORDER_PAYMENT
-        narration = f"Order payment received ({order_id}) via {data.get('provider', 'gateway')}"
+        .group_by(Account.code, JournalEntry.transaction_type)
+    )).all()
 
-    elif event_type == "seller.payout_disbursed":
-        amount = _quantize(data.get("amount", 0))
-        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
-        lines = [
-            JournalLineIn(
-                account_code="2030",
-                debit=amount,
-                credit=Decimal("0.0000"),
-                sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
-                sub_ledger_id=seller_id,
-                currency=currency,
-                description=f"Seller payout disbursed ({tx_id})",
-            ),
-            JournalLineIn(
-                account_code="1020",
-                debit=Decimal("0.0000"),
-                credit=amount,
-                sub_ledger_type=SubLedgerType.GATEWAY,
-                sub_ledger_id=tx_id,
-                currency=currency,
-                description=f"Gateway transfer out for seller payout ({tx_id})",
-            ),
-        ]
-        tx_type = TransactionType.VENDOR_PAYOUT
-        narration = f"Seller payout disbursed ({tx_id})"
+    zero = Decimal("0")
+    gross_sales = commissions = refunds = payouts = payable = zero
+    for code, ttype, debit, credit in rows:
+        debit, credit = Decimal(str(debit)), Decimal(str(credit))
+        if code == "2010":
+            gross_sales += credit                       # everything customers paid for this seller's goods
+            if ttype == TransactionType.REFUND:
+                refunds += debit                        # refunded before delivery
+        elif code == "4010":
+            commissions += credit                       # Hamads' commission, recognised at delivery
+        elif code == "2030":
+            payable += credit - debit                   # what Hamads owes the seller right now
+            if ttype == TransactionType.VENDOR_PAYOUT:
+                payouts += debit - credit               # money already sent (net of bounced transfers)
+            elif ttype == TransactionType.REFUND:
+                refunds += debit                        # refunded after delivery
 
-    elif event_type == "seller.payout_reversed":
-        amount = _quantize(data.get("amount", 0))
-        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
-        lines = [
-            JournalLineIn(
-                account_code="1020",
-                debit=amount,
-                credit=Decimal("0.0000"),
-                sub_ledger_type=SubLedgerType.GATEWAY,
-                sub_ledger_id=tx_id,
-                currency=currency,
-                description=f"Reversed payout funds returned ({tx_id})",
-            ),
-            JournalLineIn(
-                account_code="2030",
-                debit=Decimal("0.0000"),
-                credit=amount,
-                sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
-                sub_ledger_id=seller_id,
-                currency=currency,
-                description=f"Seller payable restored after failed payout ({tx_id})",
-            ),
-        ]
-        tx_type = TransactionType.ADJUSTMENT
-        narration = f"Seller payout reversed ({tx_id})"
-
-    elif event_type == "rider.payout_disbursed":
-        amount = _quantize(data.get("amount", 0))
-        rider_id = str(data["rider_id"]) if data.get("rider_id") else None
-        lines = [
-            JournalLineIn(
-                account_code="2040",
-                debit=amount,
-                credit=Decimal("0.0000"),
-                sub_ledger_type=SubLedgerType.NONE,
-                sub_ledger_id=rider_id,
-                currency=currency,
-                description=f"Rider payout disbursed ({tx_id})",
-            ),
-            JournalLineIn(
-                account_code="1020",
-                debit=Decimal("0.0000"),
-                credit=amount,
-                sub_ledger_type=SubLedgerType.GATEWAY,
-                sub_ledger_id=tx_id,
-                currency=currency,
-                description=f"Gateway transfer out for rider payout ({tx_id})",
-            ),
-        ]
-        tx_type = TransactionType.VENDOR_PAYOUT
-        narration = f"Rider payout disbursed ({tx_id})"
-
-    elif event_type == "order.cancelled":
-        refunded = _quantize(data.get("refunded_amount", 0))
-        seller_deducted = _quantize(data.get("seller_deducted", 0))
-        commission_rev = _quantize(data.get("platform_commission_reversed", 0))
-        delivery_rev = _quantize(data.get("delivery_fee_reversed", 0))
-
-        # If breakdown wasn't supplied, allocate full refund to seller payable (2030)
-        if seller_deducted == 0 and commission_rev == 0 and delivery_rev == 0:
-            seller_deducted = refunded
-        elif (seller_deducted + commission_rev + delivery_rev) != refunded:
-            seller_deducted = _quantize(refunded - commission_rev - delivery_rev)
-
-        order_id = str(data.get("order_id") or tx_id)
-        seller_id = str(data["seller_id"]) if data.get("seller_id") else None
-
-        if seller_deducted > Decimal("0.0000"):
-            lines.append(
-                JournalLineIn(
-                    account_code="2030",
-                    debit=seller_deducted,
-                    credit=Decimal("0.0000"),
-                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
-                    sub_ledger_id=seller_id,
-                    currency=currency,
-                    description=f"Seller payable reversed on cancelled Order {order_id}",
-                )
-            )
-        if commission_rev > Decimal("0.0000"):
-            lines.append(
-                JournalLineIn(
-                    account_code="4090",
-                    debit=commission_rev,
-                    credit=Decimal("0.0000"),
-                    sub_ledger_type=SubLedgerType.VENDOR if seller_id else SubLedgerType.NONE,
-                    sub_ledger_id=seller_id,
-                    currency=currency,
-                    description=f"Platform commission reversed on cancelled Order {order_id}",
-                )
-            )
-        if delivery_rev > Decimal("0.0000"):
-            lines.append(
-                JournalLineIn(
-                    account_code="2040",
-                    debit=delivery_rev,
-                    credit=Decimal("0.0000"),
-                    sub_ledger_type=SubLedgerType.NONE,
-                    currency=currency,
-                    description=f"Rider payable reversed on cancelled Order {order_id}",
-                )
-            )
-        lines.append(
-            JournalLineIn(
-                account_code="1020",
-                debit=Decimal("0.0000"),
-                credit=refunded,
-                sub_ledger_type=SubLedgerType.GATEWAY,
-                sub_ledger_id=tx_id,
-                currency=currency,
-                description=f"Customer refund disbursed for Order {order_id}",
-            )
-        )
-        tx_type = TransactionType.REFUND
-        narration = f"Order cancelled & refunded ({order_id})"
-
-    else:
-        return {"status": "ignored", "reason": f"Unhandled event_type: {event_type}"}
-
-    entry = await post_journal_entry(
-        db,
-        JournalEntryCreate(
-            transaction_type=tx_type,
-            reference_id=tx_id,
-            idempotency_key=idem_key,
-            narration=narration,
-            currency=currency,
-            lines=lines,
-        ),
+    return VendorSubLedgerSummary(
+        vendor_id=vendor_id,
+        vendor_name=party.name if party else "Unknown vendor",
+        gross_sales=_quantize(gross_sales),
+        platform_commissions=_quantize(commissions),
+        shipping_earned=_quantize(zero),
+        withholding_tax=_quantize(zero),
+        refunds_deducted=_quantize(refunds),
+        reserves_held=_quantize(zero),
+        total_payouts_completed=_quantize(payouts),
+        pending_payouts=_quantize(zero),
+        current_withdrawable_balance=_quantize(payable),
     )
-    await db.commit()
-    return {"status": "recorded", "entry_number": entry.entry_number}
