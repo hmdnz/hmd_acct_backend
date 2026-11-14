@@ -9,7 +9,8 @@ from app.modules.auth.router import router as auth_router
 app = FastAPI(
     title="Hamads Accounting",
     version="1.0.0",
-    docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
+    docs_url="/docs", # Force enable this for debugging
+    redoc_url="/redoc",
 )
 
 app.add_middleware(
